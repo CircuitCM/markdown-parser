@@ -78,7 +78,7 @@ class MarkdownIndexer:
                     new_header = f"{'#' * new_header_level} {key}. "  # Create the new header
                     section_md = _VALUE_SUB.sub(new_header, section_md, count=1)  # Replace only the first occurrence
                 else:
-                    new_header = f"{'#' * new_header_level}"
+                    #new_header = f"{'#' * new_header_level}"
                     section_md= section_md.replace('#'*(self.idx_min+k-1),'#'*new_header_level,1)
                 updated_sections.append(section_md)
             new_md = ''.join(updated_sections)
@@ -345,5 +345,3 @@ def group_layers(tuples_list, int_list,idx_list, mx):
     result_tuples.pop(-1)
 
     return result_tuples, result_sums,result_idxs
-
-
