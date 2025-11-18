@@ -1,3 +1,7 @@
+# Usage Demo
+The strength of Markdown Parser lies in meaningful use of headers and subheaders so that we get a detailed outline of our document. You will find that most tex to md converters and OCR's are pretty good at this already. 
+
+
 ```python
 from parse import MarkdownIndexer,MDProcessors,load_md
 import os
@@ -43,7 +47,7 @@ md[:] #return the entire text.
 
 
 ```python
-print('\n'.join(f"{k} : {v}" for k, v in md.index.items()))
+print('\n'.join(f"{k} : {v}" for k, v in md.index.items())) #a view of the key set, last two represent exact character section of the heading block.
 ```
 
     1 : ('Global Convergence of Online Limited Memory BFGS', 0, 277)
@@ -68,6 +72,20 @@ print('\n'.join(f"{k} : {v}" for k, v in md.index.items()))
     1.13 : ('Appendix G. Proof of Theorem 7', 127770, 136021)
     1.14 : ('References', 136021, 137372)
     
+
+Now we can utilize special indexing to get just the sections or starting offsets that we want.  
+The first meaningful behavior is that a higher-scoped section will also contain all it's sub sections.
+
+
+```python
+print(md['1'])
+```
+
+    # Global Convergence of Online Limited Memory BFGS 
+    
+    Aryan Mokhtari<br>Alejandro Ribeiro<br>Department of Electrical and Systems Engineering<br>University of Pennsylvania<br>Philadelphia, PA 19104, USA<br>ARYANM@SEAS.UPENN.EDU<br>ARIBEIRO@SEAS.UPENN.EDU
+    
+    Editor: Léon Bottou
 
 
 ```python
@@ -213,4 +231,3 @@ print(mdt2['2':'L15',None])
 
     L14 : 1074 | # 2. Introduction
     L15 : 1092 | 
-    
