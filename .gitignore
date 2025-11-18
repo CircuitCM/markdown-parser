@@ -7,5 +7,5 @@ gen
 **/*.py[cod]
 venv
 testing.ipynb
-##testing.py
+testing.py
 AGENTS.md
