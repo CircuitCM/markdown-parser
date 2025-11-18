@@ -3,9 +3,9 @@ from collections import OrderedDict
 from typing import Iterable, Collection
 from functools import cached_property
 from itertools import islice
-import tiktoken
+#import tiktoken
 
-GPTTOKEN= tiktoken.get_encoding("cl100k_base")
+GPTTOKEN=None # tiktoken.get_encoding("cl100k_base")
 
 
 _FIND_HDR=re.compile(r'^(?:#{1,6} .+)$',re.MULTILINE)
@@ -26,6 +26,71 @@ class MarkdownIndexer:
     __slots__ = ('md','idx_max','idx_min', 'index','lindex')
 
     def __init__(self, input_data):
+        """
+        Build a markdown-aware index over headings and lines.
+        
+        This constructor accepts either a markdown string, a filesystem path to a
+        markdown file, or a file-like object with ``.read()``. It parses all ATX
+        headings (``#``–``######``) to produce a stable, numeric section index and a
+        character-accurate line index, which power slicing, section selection, and
+        post-processing.
+        
+        **Heading indexing**
+        
+        - Each heading’s level is inferred from the number of leading ``#`` characters.
+        - A running counter is maintained at every level; deeper counters reset when a
+          shallower counter increments (e.g., ``2.3`` → next sibling becomes ``2.4``,
+          first child of ``2.4`` becomes ``2.4.1``).
+        - The public ``index`` maps a dotted key (e.g., ``"2.4.1"``) to a tuple
+          ``(title_text, start_char, end_char)`` where:
+          - ``title_text`` is the heading line with the ``#...`` prefix and any
+            leading numbering like ``"2.4.1"`` removed.
+          - ``start_char`` is the character offset (0-based) where the section begins
+            (at the heading’s ``#``).
+          - ``end_char`` is the character offset where the section ends (start of the
+            next section or the end of the document).
+        
+        - If the document does not begin with a heading (or the first heading is
+          unusually deep relative to the minimum level found), a synthetic
+          ``"0"`` section named ``"Start Placeholder"`` is inserted from character
+          ``0`` up to the first real heading. This preserves preamble text as an
+          addressable section.
+        
+        **Line indexing**
+        
+        - ``lindex`` is a list of ``(line_start, line_end)`` half-open spans per line.
+          ``line_end`` points just past the newline so that ``md[line_start:line_end]``
+          reconstructs the printed line reliably.
+        
+        The following attributes are set:
+        
+        - ``md``: the raw markdown text.
+        - ``index``: ordered mapping of dotted keys to ``(title, start, end)``.
+        - ``idx_min`` / ``idx_max``: the minimum heading level present and the count of
+          distinct levels represented (useful for re-leveling later).
+        - ``lindex``: per-line character spans as described above.
+        
+        :param input_data: A markdown string, a path to a markdown file, or a file-like
+                           object with a ``read()`` method.
+        :returns: A fully initialized indexer instance.
+        :raises RuntimeError: If ``input_data`` is neither a string nor a readable
+                              stream.
+        :raises FileNotFoundError: If a string path is given and cannot be opened.
+        
+        **Examples**
+        
+         .. code-block:: python
+        
+            # From a path
+            mdi = MarkdownIndexer("notes.md")
+        
+            # From a markdown string
+            mdi = MarkdownIndexer("# Title\n\nContent...")
+        
+            # From a file-like object
+            with open("notes.md", "r", encoding="utf8") as fh:
+                mdi = MarkdownIndexer(fh)
+        """
         if isinstance(input_data, str):
             if input_data.rfind('\n')==-1:
                 with open(input_data, 'r',encoding="utf8") as f:
@@ -61,10 +126,71 @@ class MarkdownIndexer:
         self.lindex=[(idxs[i - 1]+1 if i else 0, idx+1) for i, idx in enumerate(idxs)] + ([(idxs[-1], len(self.md))] if idxs and idxs[-1]+1<len(self.md) else [])
 
     def fix_write(self,path:str=None,order_sections:bool=True,shift_headings:bool=False,mdprocessors=(MDProcessors.clean_whitespace,)):
-        '''order_sections=True : places the possibly unstructured/loosely structured Markdown headers with the structured indexing of the class.
-        Because the class indexing won't actually correspond to the numbers in the header if they aren't counted properly.
-        shift_headings=True : Shifts all markdown headings down by it's minimum level. From hn - hn+m to h1 - h1+m
-        If path is None, simply returns a new MarkdownIndexer with the changes, doesn't write to file also.'''
+        """
+        Rewrite headers (and optionally normalize levels) using the computed index,
+        optionally run post-processors, and return a new ``MarkdownIndexer`` (and/or
+        write to disk).
+        
+        There are two independent operations:
+        
+        1) **Section ordering/numbering (``order_sections=True``)**  
+           Replaces the first heading token in each indexed section with a canonical
+           header that encodes both the level and the dotted section key produced by
+           this index. For example, a second-level section with key ``"3.2"`` becomes
+           ``"## 3.2. "`` regardless of the original spelling in the file. The body of
+           the section is preserved byte-for-byte after that first heading line.
+        
+        2) **Level normalization (``shift_headings``)**  
+           Computes a level shift so the shallowest heading either:
+           - **is preserved** (default): when ``shift_headings=False``, the top-level
+             headings in the output keep their original minimum level (e.g., if the
+             shallowest heading was ``###``, top-level remains ``###``).
+           - **becomes H1**: when ``shift_headings=True``, the shallowest headings are
+             shifted to ``#`` and deeper levels are shifted accordingly.
+        
+        If ``order_sections=False`` but ``shift_headings`` is enabled, only the number
+        of ``#`` characters in the very first heading line of each section is adjusted
+        (one replacement per section), and **no** dotted numbering is injected.
+        
+        After rewriting, ``mdprocessors`` (if provided) are applied to the entire
+        document in order. By default, leading/trailing file whitespace is trimmed.
+        
+        A new ``MarkdownIndexer`` over the rewritten markdown is returned (the original
+        instance is left unchanged). If ``path`` is given, the rewritten text is also
+        written there.
+        
+        :param path: Optional output path. When provided, the rewritten markdown is
+                     saved to this location.
+        :param order_sections: When ``True``, replace the first heading of each section
+                               with a canonical one based on the dotted key (e.g.,
+                               ``## 1.2. ``). When ``False``, headings are not
+                               renumbered, only level-shifted if requested.
+        :param shift_headings: When ``True``, normalize the shallowest heading level to
+                               H1 and shift others accordingly. When ``False``, retain
+                               the document’s original minimum level.
+        :param mdprocessors: A callable or iterable of callables ``fn(str)->str`` that
+                             are applied to the rewritten markdown in sequence. Use
+                             ``None`` to disable post-processing.
+        :returns: A ``MarkdownIndexer`` over the rewritten markdown (possibly the same
+                  object if no changes were requested), and writes to ``path`` if set.
+        
+        **Examples**
+        
+        .. code-block:: python
+        
+            # Normalize so the shallowest heading becomes H1 and inject dotted numbers
+            new = mdi.fix_write(order_sections=True, shift_headings=True)
+        
+            # Only shift levels (keep original titles and don’t inject "1.2.")
+            new = mdi.fix_write(order_sections=False, shift_headings=True)
+        
+            # Write to disk and redact links via a custom processor
+            new = mdi.fix_write(
+                path="clean.md",
+                order_sections=True,
+                mdprocessors=(MDProcessors.redact_links, MDProcessors.clean_whitespace),
+            )
+        """
         # Initialize an empty list to store the updated markdown sections
         new_md=self.md
         if order_sections or shift_headings:
@@ -109,6 +235,62 @@ class MarkdownIndexer:
         return self.__str__()
 
     def __getitem__(self, keys):
+        """
+        Return markdown substrings or annotated line views using flexible, pythonic
+        indexing.
+        
+        This accessor accepts:
+        
+        - **Dotted keys** (e.g., ``"2.4.1"``): select that entire section.
+        - **Integer character offsets**: select raw character spans.
+        - **Line keys** of the form ``"L<n>"`` / ``"l<n>"``: map to the start/end
+          character offsets of line ``n`` using the precomputed ``lindex``.
+        - **Slices**: ``start:stop:step`` where each endpoint can be any of the above or
+          ``None``. The slice operates on the underlying string (so ``step`` behaves
+          like normal Python slicing).
+        - **Tuples of length 2**: ``(key_or_slice, anything)`` returns the same
+          selection but **annotated** with line numbers and starting character offsets.
+          The second tuple element is ignored; its presence opts into line annotation.
+        
+        **Return modes**
+        
+        - Default: a substring of ``md`` for the requested character range.
+        - Annotated mode (two-item tuple): a string with one line per visible line in
+          the selection, each prefixed like ``"L12 : 1234 | <line text>"``, where:
+          - ``L12`` is the absolute line number in the original document.
+          - ``1234`` is the character offset where that printed line starts
+            (for the first printed line, the exact slice start is used).
+        
+        :param keys: A dotted key, character offset, line key (``"L<n>"``), a slice of
+                     any of those, or a 2-tuple to request the annotated view.
+        :returns: Either the substring for the computed range or an annotated, line-
+                  numbered view when a tuple was used.
+        :raises IndexError: If a tuple of invalid arity is provided.
+        :raises KeyError: If a non-existent dotted key or line key is provided.
+        :raises ValueError: If a line key suffix cannot be parsed as an integer.
+        
+        **Examples**
+        
+        .. code-block:: python
+        
+            # Whole section by dotted key
+            mdi["2.3"]
+        
+            # Character-span slice (first 100 chars)
+            mdi[:100]
+        
+            # Lines 10 through 14 (inclusive of 10, exclusive of 15 as a char slice)
+            mdi["L10":"L15"]
+        
+            # Section with line annotations
+            print(mdi["2.3", None])
+        
+            # Cross-boundary slice using headings
+            mdi["1.2":"1.4"]
+        
+            # Step slicing across characters (every other byte in a section)
+            mdi["2.1":"2.2":2]
+        """
         include_line_info = False
         #print(keys)
         if isinstance(keys, slice):
@@ -162,10 +344,9 @@ class MarkdownIndexer:
 
         raise KeyError(f"Invalid key: {key}")
 
-        # This is gotta be more efficient than a binary search.
-
     def _find_line_idx(self, _idx):
         # Estimate the line index
+        # Essentially a secant guess for discrete monotonic
         est_idx = int(_idx * (len(self.lindex) - 1) / len(self.md))
         # When searching for a line we look for the beginning of a new line.
         while self.lindex[est_idx][1] <= _idx:
@@ -174,9 +355,43 @@ class MarkdownIndexer:
         while self.lindex[est_idx][0] > _idx:
             #print('down 1')
             est_idx -= 1
+        #Chose to while loop instead of bisect because any further secant guesses are likely to be innaccurate and we don't have a
+        #POV for the near opposite bound, so bisection may have to proceed from the end or start of the markdown text.
+        #Also the amount of loops required is often a tiny fraction of # lines for a normal dataset.
         return est_idx
 
     def idx_tuple(self, inx: str,tolast=True):
+        """
+        Convert a dotted section key into a fixed-length tuple suitable for
+        range-comparisons across levels.
+        
+        The tuple length equals the number of heading levels represented in the
+        document (``idx_max - idx_min + 1``). Missing deeper components are padded
+        with zeros so that lexicographic comparison mirrors section ordering.
+        
+        Special handling is provided when ``inx`` is ``None``:
+        
+        - If ``tolast=False``, the first key in ``index`` is used.
+        - If ``tolast=True`` (default), the last key in ``index`` is taken and the
+          **first** component is incremented by one while all deeper components are set
+          to zero. This produces a convenient exclusive upper bound sentinel for range
+          scans (i.e., “just past the end” of the last top-level group).
+        
+        :param inx: A dotted key like ``"2.4.1"`` or ``None`` for sentinel behavior.
+        :param tolast: Controls how ``None`` is resolved; see above.
+        :returns: A tuple of integers suitable for ordering and boundary tests.
+        
+        **Examples**
+        
+        .. code-block:: python
+        
+            # Direct conversion
+            mdi.idx_tuple("2.1.3")   # -> (2, 1, 3, 0, ...)
+        
+            # Lower/upper sentinels for slicing ranges
+            lo = mdi.idx_tuple("1.2", tolast=False)
+            hi = mdi.idx_tuple(None, tolast=True)   # one past the last top-level
+        """
         spl =(inx if inx is not None else next(reversed(self.index.keys())) if tolast else next(iter(self.index.keys()))).split('.')
         lc = len(spl)
         if inx is not None or not tolast:
@@ -198,11 +413,13 @@ def apply_filters(obj, *args):
 
 
 def load_md(md_path, processors=(MDProcessors.redact_links,)):
+    if processors is None:processors=()
     with open(md_path, 'r', encoding='utf-8') as mdf:
         return apply_filters(mdf.read(), *processors)
 
 import anyio
 async def aload_md(md_path, processors=(MDProcessors.redact_links,)):
+    if processors is None:processors=()
     async with await anyio.open_file(md_path, 'r', encoding='utf-8') as mdf:
         return apply_filters(await mdf.read(), *processors)
 
@@ -236,6 +453,7 @@ def make_llmsections(mdi: MarkdownIndexer, *slices, mx_tokens=int(8192 * 5 / 8),
 
 
 def _get_sectionidx(mdi: MarkdownIndexer, *slices):
+    
     sectns = []
     secgps = []
     if len(slices) == 0 or slices[0] is None:
