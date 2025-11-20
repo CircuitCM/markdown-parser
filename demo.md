@@ -73,11 +73,11 @@ print('\n'.join(f"{k} : {v}" for k, v in md.index.items())) #a view of the key s
     1.14 : ('References', 136021, 137372)
     
 
-Now we can utilize special indexing to get just the sections or starting offsets that we want.  
-The first meaningful behavior is that a higher-scoped section will also contain all it's sub sections.
+Now we can utilize header indexing to get just the sections or starting offsets that we want.  
 
 
 ```python
+#Note: Outer scoped headers will not return all their subsections because we'd lose a convenient way to obtain the text inbetween.
 print(md['1'])
 ```
 
@@ -86,6 +86,10 @@ print(md['1'])
     Aryan Mokhtari<br>Alejandro Ribeiro<br>Department of Electrical and Systems Engineering<br>University of Pennsylvania<br>Philadelphia, PA 19104, USA<br>ARYANM@SEAS.UPENN.EDU<br>ARIBEIRO@SEAS.UPENN.EDU
     
     Editor: Léon Bottou
+    
+    
+    
+    
 
 
 ```python
@@ -231,3 +235,4 @@ print(mdt2['2':'L15',None])
 
     L14 : 1074 | # 2. Introduction
     L15 : 1092 | 
+    
