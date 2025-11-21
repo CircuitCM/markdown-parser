@@ -233,6 +233,50 @@ class MarkdownIndexer:
 
     def __repr__(self):
         return self.__str__()
+    
+    @property
+    def info(self):
+        """
+        Summarize all indexed sections with both line and character extents.
+
+        Each line of the returned string has the form::
+
+            <key> - [L<start_line>:L<end_line>] [<start_char>:<end_char>] - <title>
+
+        where:
+
+        - ``<key>`` is the dotted section key from ``self.index`` (e.g. ``"1"``).
+        - ``[Lstart:Lend]`` is a half-open range of **zero-based** line indices:
+          - ``Lstart`` is the line where the section's heading begins.
+          - ``Lend`` is the line where the section's end boundary falls
+            (usually the next section's heading line, or ``L<N>`` for the end
+            of the document).
+        - ``[start:end]`` is the corresponding half-open character span from
+          the index (``start`` inclusive, ``end`` exclusive).
+        - ``<title>`` is the cleaned heading text for the section.
+
+        This uses the precomputed ``index`` and ``lindex`` along with
+        ``_find_line_idx``; it does not scan the markdown content.
+
+        :returns: A newline-joined string describing all sections in document
+                  order.
+        """
+        def _char_to_line(idx: int) -> int:
+            # Map a character offset to a zero-based line index in lindex,
+            # using len(lindex) as the open-ended sentinel for EOF.
+            if idx >= len(self.md):
+                return len(self.lindex)
+            return self._find_line_idx(idx)
+
+        #it might be a bit quicker to just build KV's for line to char to section. However 
+        #_find_line_idx honestly shouldn't be that much slower.
+        lines = []
+        for key, (title, start_idx, end_idx) in self.index.items():
+            start_line = _char_to_line(start_idx)
+            end_line = _char_to_line(end_idx)
+            lines.append(f"{'   '*key.count('.')}{key} - [L{start_line}:L{end_line}] [{start_idx}:{end_idx}] - {title}")
+        return "\n".join(lines)
+        
 
     def __getitem__(self, keys):
         """
@@ -427,6 +471,43 @@ async def aload_md(md_path, processors=(MDProcessors.redact_links,)):
 _model_costs = {'gpt-4':(.03,.06),'gpt-3.5':(.0015,.002)} #per 1k tokens
 
 def estimate_llmcost(mdi:MarkdownIndexer,*slices,model='gpt-4',input_ratio=1.+.33,output_ratio=.33, _tokenizer=GPTTOKEN): #guestimates on research reading.
+    """
+    Estimate the dollar cost of sending one or more selections of this markdown to
+    an LLM, assuming a simple input/output token ratio model.
+    
+    The selections are specified using the **same addressing forms supported by
+    ``__getitem__``** (single keys, slices, etc.). Each selection is extracted,
+    tokenized with the configured tokenizer, and the token counts are summed to
+    produce a cost estimate using the per-1k-token prices in ``_model_costs`` and
+    the provided input/output ratios.
+    
+    :param mdi: A ``MarkdownIndexer`` instance to read from.
+    :param slices: Zero or more selections (keys or slices). When omitted, the
+                   entire document is used.
+    :param model: A key present in ``_model_costs`` (e.g., ``"gpt-4"``). Determines
+                  the per-1k token pricing for input and output.
+    :param input_ratio: Multiplier applied to input token pricing. Use this to
+                        approximate system/user prompt overhead.
+    :param output_ratio: Multiplier applied to output token pricing. Use this to
+                         budget for the model’s response length.
+    :param _tokenizer: A callable with ``encode_ordinary_batch(List[str]) -> List[List[int]]``.
+                       Provided to allow custom tokenizers in tests.
+    :returns: A floating-point cost estimate in USD for the combined selections.
+    :raises KeyError: If ``model`` is not present in ``_model_costs``.
+    
+    **Examples**
+    
+    .. code-block:: python
+    
+        # Whole document on gpt-4 with default ratios
+        cost = estimate_llmcost(mdi)
+    
+        # Just chapter 2 and its appendices
+        cost = estimate_llmcost(mdi, "2", "2.1":"2.4")
+    
+        # Tighter output budget
+        cost = estimate_llmcost(mdi, "1":"3", output_ratio=0.15)
+    """
     if len(slices)==0: slices=[slice(None,None)]
     tgroups = [len(tkg) for tkg in _tokenizer.encode_ordinary_batch([mdi[slic] for slic in slices])]
     ttks=sum(tgroups)
@@ -435,19 +516,66 @@ def estimate_llmcost(mdi:MarkdownIndexer,*slices,model='gpt-4',input_ratio=1.+.3
 
 
 def make_llmsections(mdi: MarkdownIndexer, *slices, mx_tokens=int(8192 * 5 / 8),isolate_section=False, _tokenizer=GPTTOKEN):
+    """
+    Partition the document into section-aligned chunks that do not exceed a target
+    token budget, returning dotted keys, token totals, and exact character spans.
+    
+    This utility first expands the given selections into concrete **leaf-level
+    sections** using the index (or uses all sections when no selections are
+    supplied). It then tokenizes each section and groups **contiguous** sections
+    into larger chunks so that the **sum of tokens per chunk** stays under
+    ``mx_tokens`` while respecting natural boundaries in the heading hierarchy.
+    
+    Chunk boundaries are chosen to keep sections together when possible, split on
+    higher-level transitions when needed, and always emit at least a full top-level
+    section as its own chunk. The return value encodes both human-readable
+    identifiers and precise character spans, so you can slice the original markdown
+    directly.
+    
+    .. note::
+       ``isolate_section=True`` is a placeholder and is not implemented; the
+       function returns ``None`` in that case.
+    
+    :param mdi: A ``MarkdownIndexer`` instance to read from.
+    :param slices: Zero or more addressers (keys or slices) to limit which sections
+                  participate. Omitted means “all sections.”
+    :param mx_tokens: Maximum number of tokens allowed per chunk.
+    :param isolate_section: Reserved for future behavior that would forbid grouping
+                            across siblings; currently not implemented.
+    :param _tokenizer: A callable with ``encode_ordinary_batch(List[str])`` used to
+                       count tokens per section.
+    :returns: ``(chunk_keys, token_sums, char_spans)`` where:
+              - ``chunk_keys`` is a list of dotted keys identifying the **first**
+                section in each emitted chunk.
+              - ``token_sums`` is a list of total tokens per chunk.
+              - ``char_spans`` is a list of ``(start_char, end_char)`` for each
+                chunk, suitable for slicing ``mdi.md[start:end]``.
+    :raises ValueError: If no sections are available to group (e.g., empty index).
+    
+    **Examples**
+    
+    .. code-block:: python
+    
+        # Split the whole doc into ~1200-token pieces
+        keys, sizes, spans = make_llmsections(mdi, mx_tokens=1200)
+        parts = [mdi.md[s:e] for (s, e) in spans]
+    
+        # Only chapters 2–4
+        keys, sizes, spans = make_llmsections(mdi, "2":"5", mx_tokens=2000)
+    """
     # for now it only supports heading indexing, and no steps. if not slice it's a single value.
     # assuming sections are ordered and no duplicates.
     sec_idxs,sec_parts=_get_sectionidx(mdi,*slices)
-    print(sec_idxs)
-    print(sec_parts)
+    #print(sec_idxs)
+    #print(sec_parts)
     if isolate_section:
         print('Isolated sections not implemented yet, use individual top layer selections for book chapters.')
         return None
     else:
         tgroups=[len(tkg) for tkg in _tokenizer.encode_ordinary_batch([mdi.md[s0:s1] for s0,s1 in sec_parts])]
-        print(tgroups)
+        #print(tgroups)
         idx_tples,sums,exact_idxs = group_layers(sec_idxs,tgroups,sec_parts,mx_tokens)
-        print(idx_tples,sums,exact_idxs)
+        #print(idx_tples,sums,exact_idxs)
         return [tuple_idx(i) for i in idx_tples],sums,exact_idxs
 
 
@@ -508,6 +636,56 @@ import numpy as np
 
 
 def group_layers(tuples_list, int_list,idx_list, mx):
+    """
+    Greedy, hierarchy-aware grouper for section tuples and sizes.
+    
+    Given:
+    
+    - ``tuples_list`` — the section identifiers as **fixed-length tuples** (e.g.,
+      ``(2, 1, 0, 0)``) ordered exactly as they appear in the document,
+    - ``int_list`` — the size for each section (e.g., token counts),
+    - ``idx_list`` — the exact ``(start_char, end_char)`` span for each section,
+    
+    this function emits chunk boundaries that:
+    
+    1. Keep adjacent sections together until the running total would exceed ``mx``.
+    2. Prefer to split on **higher-level** transitions (chapter → next chapter)
+       before lower ones when possible.
+    3. Always include **top-level** sections as independent candidates so that a
+       whole chapter is never silently merged into the next.
+    
+    The result is three parallel lists:
+    
+    - ``result_tuples`` — the tuple key of the **first** section in each emitted
+      chunk (these align with dotted keys via ``tuple_idx`` elsewhere).
+    - ``result_sums`` — the sum of sizes within each chunk.
+    - ``result_idxs`` — the merged character span of all sections in the chunk,
+      suitable for slicing the source text.
+    
+    Internally, the algorithm tracks running sums per layer and resets/flushes
+    groups whenever a tuple’s prefix changes at that layer. When a layer’s running
+    sum exceeds ``mx``, the current group at that layer is closed and emitted.
+    
+    :param tuples_list: Ordered list of section tuple IDs (all the same depth).
+    :param int_list: Parallel list of integer sizes for each section.
+    :param idx_list: Parallel list of ``(start_char, end_char)`` spans per section.
+    :param mx: Maximum allowed sum per emitted group.
+    :returns: ``(result_tuples, result_sums, result_idxs)`` as described above.
+    :raises AssertionError: If the three input lists differ in length.
+    
+    **Examples**
+    
+    .. code-block:: python
+    
+        # Suppose chapters 1..3 with small subsections
+        tuples = [(1,0), (1,1), (1,2), (2,0), (2,1), (3,0)]
+        sizes  = [800,   300,   400,   900,   500,   700]
+        spans  = [(0,100),(100,150),(150,220),(220,330),(330,400),(400,480)]
+    
+        # With mx=1000, this will prefer cuts at top-level boundaries,
+        # but will also split mid-chapter if needed.
+        tkeys, sums, idxs = group_layers(tuples, sizes, spans, mx=1000)
+    """
     # Initialize variables
     depth = len(tuples_list[0])  # Depth of the tuples
     layer_sum, layer_idx = np.zeros(depth-1,dtype=np.int32), np.zeros(depth-1,dtype=np.int32)  # Counters for each layer

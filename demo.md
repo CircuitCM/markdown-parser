@@ -1,15 +1,15 @@
 # Usage Demo
-The strength of Markdown Parser lies in meaningful use of headers and subheaders so that we get a detailed outline of our document. You will find that most tex to md converters and OCR's are pretty good at this already. 
-
+The strength of Markdown Parser lies in meaningful use of headers and subheaders so that we get a detailed outline of our document. You will find that most tex to md converters and OCR's are pretty good at this already.
 
 ```python
-from parse import MarkdownIndexer,MDProcessors,load_md
+from markp import MarkdownIndexer, MDProcessors, load_md
 import os
 
-txt=load_md(r'D:\OneDrive - The University of Chicago\Research\Useful\Gradient Optimizer Research\oLBFGS\ocr\oLBFGS_copy.md',())#(MDProcessors.redact_links,))
+txt = load_md(r'D:\OneDrive - The University of Chicago\Research\Useful\Gradient Optimizer Research\oLBFGS\ocr\oLBFGS_copy.md',
+              ())  # (MDProcessors.redact_links,))
 
 md = MarkdownIndexer(txt)
-md #To display the section index and summary info
+md  # To display the section index and summary info
 ```
 
 
@@ -235,4 +235,3 @@ print(mdt2['2':'L15',None])
 
     L14 : 1074 | # 2. Introduction
     L15 : 1092 | 
-    
